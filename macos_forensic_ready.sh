@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[*] macOS Forensic Logging Setup (auditd + Unified Logs)"
+echo "[*] macOS Forensic Logging Setup (PRODUCTION-SAFE)"
 
 # ---------------------------
 # 0) Pre-check
 # ---------------------------
 if [[ $EUID -ne 0 ]]; then
-  echo "[!] Jalankan sebagai root (sudo)."
+  echo "[!] Run as root (sudo)."
   exit 1
 fi
+
+AUDIT_CTL="/etc/security/audit_control"
+TS="$(date +%Y%m%d%H%M%S)"
 
 # ---------------------------
 # 1) Ensure audit directory
@@ -20,82 +23,77 @@ chmod 700 /var/audit
 chown root:wheel /var/audit
 
 # ---------------------------
-# 2) Backup & configure audit_control
+# 2) Configure audit_control (minimal & stable)
 # ---------------------------
-AUDIT_CTL="/etc/security/audit_control"
-TS="$(date +%Y%m%d%H%M%S)"
+echo "[*] Backing up audit_control"
+cp "$AUDIT_CTL" "${AUDIT_CTL}.bak.${TS}" 2>/dev/null || true
 
-echo "[*] Backup $AUDIT_CTL"
-cp "$AUDIT_CTL" "${AUDIT_CTL}.bak.${TS}" || true
+echo "[*] Applying production-safe audit policy"
 
-echo "[*] Writing forensic-friendly audit policy"
 cat > "$AUDIT_CTL" << 'EOF'
 dir:/var/audit
-flags:lo,aa,pc,ex,fw
-minfree:5
+flags:lo,aa,pc,ex
 naflags:lo,aa
 policy:cnt,argv
-filesz:50M
-expire-after:7d
+minfree:10
+filesz:25M
+expire-after:3d
+host:localhost
 EOF
 
-# Keterangan singkat:
-# pc,ex  -> process creation & execution (WAJIB)
-# argv   -> capture command line
-# fw     -> file write (berguna untuk perubahan file)
-# filesz -> rotasi file (hindari disk penuh)
-# expire-after -> retensi
+# Explanation:
+# pc,ex  -> essential execution tracking
+# argv   -> command-line visibility
+# NO fw  -> reduce noise & disk usage
+# smaller filesz -> better rotation
+# shorter retention -> prevent disk growth
 
 # ---------------------------
-# 3) Enable & (re)start auditd (modern launchctl)
+# 3) Ensure auditd running (NO aggressive restart)
 # ---------------------------
-echo "[*] Enabling auditd"
-launchctl enable system/com.apple.auditd || true
+echo "[*] Checking auditd status"
 
-echo "[*] Bootstrapping auditd (ignore if already loaded)"
-launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.auditd.plist 2>/dev/null || true
+if launchctl print system/com.apple.auditd 2>/dev/null | grep -q "state = running"; then
+  echo "[*] auditd already running"
+else
+  echo "[*] Starting auditd"
+  launchctl enable system/com.apple.auditd 2>/dev/null || true
+  launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.auditd.plist 2>/dev/null || true
+  launchctl kickstart -k system/com.apple.auditd 2>/dev/null || true
+fi
 
-echo "[*] Restarting auditd"
-launchctl kickstart -k system/com.apple.auditd
-
-echo "[*] Reload audit subsystem"
+# Apply config once (safe)
+echo "[*] Reloading audit subsystem"
 audit -s
 
 # ---------------------------
-# 4) Increase Unified Logging verbosity
+# 4) Unified Logging (NO debug mode)
 # ---------------------------
-echo "[*] Configuring Unified Logging verbosity"
-# buka private data (berguna untuk DFIR)
-log config --mode "private_data:on" || true
-# naikkan level untuk subsystem Apple (lab only)
-log config --subsystem com.apple --mode level:debug || true
+echo "[*] Keeping default Unified Logging (production-safe)"
+
+# DO NOT enable:
+# - private_data:on
+# - debug level
+# Reason: may expose sensitive data & increase noise
 
 # ---------------------------
-# 5) Quick validation (generate minimal events)
+# 5) Lightweight validation
 # ---------------------------
-echo "[*] Generating test events"
-# jalankan sebagai user pemanggil (kalau ada)
-if [[ -n "${SUDO_USER:-}" ]]; then
-  su - "$SUDO_USER" -c 'osascript -e "display dialog \"forensic logging test\""' || true
-  su - "$SUDO_USER" -c 'whoami >/dev/null' || true
+echo "[*] Validating logging (light check)"
+
+if ls /var/audit/* 1>/dev/null 2>&1; then
+  echo "[PASS] Audit logs present"
 else
-  osascript -e 'display dialog "forensic logging test"' || true
-  whoami >/dev/null || true
+  echo "[WARN] No audit logs detected"
 fi
 
-# ---------------------------
-# 6) Validation outputs
-# ---------------------------
-echo "[*] Audit files:"
-ls -lah /var/audit || true
+if sudo praudit /var/audit/current 2>/dev/null | grep -q exec; then
+  echo "[PASS] Execution events detected"
+else
+  echo "[WARN] No execution events found yet"
+fi
 
-echo "[*] auditd status (short):"
-launchctl print system/com.apple.auditd | head -20 || true
+echo "[*] auditd state:"
+launchctl print system/com.apple.auditd | grep state || true
 
-echo "[*] Sample audit parse (exec events):"
-praudit /var/audit/current 2>/dev/null | grep exec | head -20 || true
-
-echo "[*] Sample Unified Logs (osascript, last 5m):"
-log show --predicate 'process == "osascript"' --last 5m --info --debug | head -20 || true
-
-echo "[✓] Forensic logging baseline applied"
+echo "[✓] Production-safe forensic logging applied"
